@@ -21,60 +21,31 @@
 namespace DarkWebDesign\DoctrineAdvancedCriteria\ORM;
 
 use BadMethodCallException;
-use Doctrine\Common\Persistence\ObjectManager;
+use DarkWebDesign\DoctrineAdvancedCriteria\ORM\ORMException;
+use DateTime;
 use Doctrine\Common\Util\Inflector;
 use Doctrine\ORM\EntityRepository as DoctrineEntityRepository;
 use Doctrine\ORM\Mapping\ClassMetadata;
-use Doctrine\ORM\ORMException;
 use Doctrine\ORM\QueryBuilder;
 
 /**
  * Enables advanced criteria on the Doctrine entity repository.
  *
  * @author Raymond Schouten
- *
- * @todo relations
  */
 class EntityRepository extends DoctrineEntityRepository
 {
     /** @var string */
-    protected $alias = '';
+    private $rootAlias;
+
+    /** @var int */
+    private $aliasIndex;
 
     /** @var array */
-    protected $defaultOrderBy = array();
+    private $innerJoins;
 
-    /**
-     * Constructor.
-     *
-     * @param \Doctrine\Common\Persistence\ObjectManager $entityManager
-     * @param \Doctrine\ORM\Mapping\ClassMetadata $class
-     */
-    public function __construct(ObjectManager $entityManager, ClassMetadata $class)
-    {
-        parent::__construct($entityManager, $class);
-
-        $this->initAlias();
-    }
-
-    /**
-     * Initializes entity alias.
-     */
-    protected function initAlias()
-    {
-        if ($this->alias === '') {
-            $this->alias = strtolower(substr(strrchr($this->getClassName(), '\\'), 1));
-        }
-    }
-
-    /**
-     * Finds all entities in the repository.
-     *
-     * @return array
-     */
-    public function findAll()
-    {
-        return $this->findBy(array());
-    }
+    /** @var \Doctrine\ORM\QueryBuilder */
+    private $queryBuilder;
 
     /**
      * Finds a single entity by a set of criteria.
@@ -105,15 +76,19 @@ class EntityRepository extends DoctrineEntityRepository
      */
     public function findBy(array $criteria, array $orderBy = null, $limit = null, $offset = null)
     {
-        $queryBuilder = $this->createQueryBuilder($this->alias);
+        $this->resetFind();
 
-        $this->handleCriteria($queryBuilder, $criteria);
-        $this->handleOrderBy($queryBuilder, $orderBy);
-        $this->addLimitAndOffset($queryBuilder, $limit, $offset);
+        $this->rootAlias = $this->generateAlias();
 
-//        var_dump($queryBuilder->getQuery()->getSQL());
+        $this->queryBuilder = $this->createQueryBuilder($this->rootAlias);
 
-        return $queryBuilder->getQuery()->getResult();
+        $this->handleCriteria($criteria);
+        $this->handleOrderBy($orderBy);
+
+        $this->queryBuilder->setMaxResults($limit);
+        $this->queryBuilder->setFirstResult($offset);
+
+        return $this->queryBuilder->getQuery()->getResult();
     }
 
     /**
@@ -135,13 +110,16 @@ class EntityRepository extends DoctrineEntityRepository
      */
     public function findCountBy(array $criteria)
     {
-        $queryBuilder = $this
-            ->createQueryBuilder($this->alias)
-            ->select('COUNT(' . $this->alias . ')');
+        $this->resetFind();
 
-        $this->handleCriteria($queryBuilder, $criteria);
+        $this->rootAlias = $this->generateAlias();
 
-        return (int) $queryBuilder->getQuery()->getSingleScalarResult();
+        $this->queryBuilder = $this->createQueryBuilder($this->rootAlias);
+        $this->queryBuilder->select($this->queryBuilder->expr()->countDistinct($this->rootAlias));
+
+        $this->handleCriteria($criteria);
+
+        return (int) $this->queryBuilder->getQuery()->getSingleScalarResult();
     }
 
     /**
@@ -187,32 +165,97 @@ class EntityRepository extends DoctrineEntityRepository
     }
 
     /**
+     * Resets internal state for find* methods.
+     */
+    private function resetFind()
+    {
+        $this->aliasIndex = 0;
+        $this->innerJoins = array();
+    }
+
+    /**
      * Handles criteria.
      *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
      * @param array $criteria
      *
      * @throws \Doctrine\ORM\ORMException
      */
-    protected function handleCriteria(QueryBuilder $queryBuilder, array $criteria)
+    private function handleCriteria(array $criteria)
     {
         foreach ($criteria as $field => $fieldCriteria) {
-            if ($this->getClassMetadata()->hasField($field) || $this->getClassMetadata()->hasAssociation($field)) {
-                $this->handleFieldCriteria($queryBuilder, $this->alias . '.' . $field, $fieldCriteria);
+            list($field, $alias, $classMetadata) = $this->handleFieldAssociations($field);
+            if ($classMetadata->hasField($field) || $classMetadata->hasAssociation($field)) {
+                $this->handleFieldCriteria($alias . '.' . $field, $fieldCriteria);
             } else {
-                throw ORMException::unrecognizedField($field);
+                throw ORMException::unknownField($classMetadata->getName(), $field);
             }
         }
     }
 
     /**
+     * Handles order-by.
+     *
+     * @param array|null $orderBy
+     *
+     * @throws \Doctrine\ORM\ORMException
+     */
+    private function handleOrderBy(array $orderBy = null)
+    {
+        foreach ((array) $orderBy as $field => $order) {
+            list($field, $alias, $classMetadata) = $this->handleFieldAssociations($field);
+            if ($classMetadata->hasField($field) || $classMetadata->hasAssociation($field)) {
+                $this->addOrderBy($alias . '.' . $field, $order);
+            } else {
+                throw ORMException::unknownField($classMetadata->getName(), $field);
+            }
+        }
+    }
+
+    /**
+     * Handles field associations.
+     *
+     * @param string $field
+     *
+     * @throws \Doctrine\ORM\ORMException
+     *
+     * @return array
+     */
+    private function handleFieldAssociations($field)
+    {
+        $alias = $this->rootAlias;
+        $classMetadata = $this->getClassMetadata();
+
+        if (strpos($field, '.') !== false) {
+            $associations = explode('.', $field);
+            $field = array_pop($associations);
+            $path = '';
+
+            foreach ($associations as $association) {
+                if ($classMetadata->hasAssociation($association)) {
+                    $path = ltrim($path . '.' . $association, '.');
+                    if (!isset($this->innerJoins[$path])) {
+                        $this->innerJoins[$path] = $this->generateAlias();
+                        $this->addInnerJoin($alias . '.' . $association, $this->innerJoins[$path]);
+                    }
+                    $alias = $this->innerJoins[$path];
+                    $className = $classMetadata->getAssociationTargetClass($association);
+                    $classMetadata = $this->getEntityManager()->getClassMetadata($className);
+                } else {
+                    throw ORMException::unknownAssociation($classMetadata->getName(), $association);
+                }
+            }
+        }
+
+        return array($field, $alias, $classMetadata);
+    }
+
+    /**
      * Handles field criteria.
      *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
      * @param string $field
      * @param mixed $fieldCriteria
      */
-    protected function handleFieldCriteria(QueryBuilder $queryBuilder, $field, $fieldCriteria)
+    private function handleFieldCriteria($field, $fieldCriteria)
     {
         if (!$this->hasFieldAdvancedCriteria($fieldCriteria)) {
             if (is_null($fieldCriteria)) {
@@ -226,124 +269,218 @@ class EntityRepository extends DoctrineEntityRepository
         }
 
         $fieldCriteria = array_change_key_case($fieldCriteria, CASE_UPPER);
+
         foreach ($fieldCriteria as $operator => $value) {
-            $this->validateOperator($operator, $value);
-            $this->addWhere($queryBuilder, $field, $operator, $value);
+            $this->validateOperator($operator);
+            $this->validateOperatorValue($operator, $value);
+            $this->addWhere($field, $operator, $value);
         }
     }
 
     /**
-     * Checks if the field criteria contains advanced criteria.
+     * Checks if field criteria contains advanced criteria.
      *
      * @param mixed $fieldCriteria
      *
      * @return bool
      */
-    protected function hasFieldAdvancedCriteria($fieldCriteria)
+    private function hasFieldAdvancedCriteria($fieldCriteria)
     {
         return is_array($fieldCriteria) && array_keys($fieldCriteria) !== range(0, count($fieldCriteria) - 1);
     }
 
     /**
-     * Validates operator based upon the value.
+     * Validates operator.
+     *
+     * @param string $operator
+     *
+     * @throws \Doctrine\ORM\ORMException
+     */
+    private function validateOperator($operator)
+    {
+        static $operators = array(
+            '=', '!=', '<>', '<', '>', '<=', '>=',
+            'IS', 'IS NOT',
+            'LIKE', 'NOT LIKE',
+            'IN', 'NOT IN',
+            'BETWEEN', 'NOT BETWEEN',
+            'INSTANCEOF',
+        );
+
+        if (!in_array($operator, $operators)) {
+            throw ORMException::invalidOperator($operator);
+        }
+    }
+
+    /**
+     * Validates operator value.
      *
      * @param string $operator
      * @param mixed $value
      *
      * @throws \Doctrine\ORM\ORMException
      */
-    protected function validateOperator($operator, $value)
+    private function validateOperatorValue($operator, $value)
     {
         static $typeOperators = array(
-            'boolean' => array('=', '!=', '<>'),
-            'integer' => array('=', '!=', '<>', '>', '<', '<=', '>='),
-            'double' => array('=', '!=', '<>', '>', '<', '<=', '>='),
-            'string' => array('=', '!=', '<>', '>', '<', '<=', '>=', 'LIKE', 'NOT LIKE'),
-            'array' => array('IN', 'NOT IN'),
-            'object' => array('=', '!=', '<>'),
-            'NULL' => array('IS', 'IS NOT'),
+            'boolean'         => array('=', '!=', '<>', 'IS', 'IS NOT'),
+            'integer'         => array('=', '!=', '<>', '<', '>', '<=', '>='),
+            'double'          => array('=', '!=', '<>', '<', '>', '<=', '>='),
+            'string'          => array('=', '!=', '<>', '<', '>', '<=', '>=', 'LIKE', 'NOT LIKE'),
+            'string/entity'   => array('=', '!=', '<>', '<', '>', '<=', '>=', 'LIKE', 'NOT LIKE', 'INSTANCEOF'),
+            'array'           => array('IN', 'NOT IN'),
+            'array/range'     => array('IN', 'NOT IN', 'BETWEEN', 'NOT BETWEEN'),
+            'object/datetime' => array('=', '!=', '<>', '<', '>', '<=', '>=', 'LIKE', 'NOT LIKE'),
+            'object/entity'   => array('=', '!=', '<>'),
+            'object/string'   => array('=', '!=', '<>', '<', '>', '<=', '>=', 'LIKE', 'NOT LIKE'),
+            'null'            => array('IS', 'IS NOT'),
         );
 
-        if (!array_key_exists(gettype($value), $typeOperators)) {
-            throw new ORMException(sprintf('Criteria type "%s" is not supported.', gettype($value)));
-        }
+        $type = $this->determineType($value);
 
-        if (!in_array($operator, $typeOperators[gettype($value)], true)) {
-            throw new ORMException(
-                sprintf('Operator "%s" is not supported for type "%s".', $operator, gettype($value))
-            );
+        if (!array_key_exists($type, $typeOperators) || !in_array($operator, $typeOperators[$type])) {
+            throw ORMException::invalidOperatorValue($operator);
         }
     }
 
     /**
-     * Adds criteria to query builder.
+     * Determines the value type.
      *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
+     * @param mixed $value
+     *
+     * @return string
+     */
+    private function determineType($value)
+    {
+        $type = strtolower(gettype($value));
+
+        if ('string' === $type && $this->isEntity($value)) {
+            $type = 'string/entity';
+        } elseif ('object' === $type) {
+            if ($value instanceof DateTime) {
+                $type = 'object/datetime';
+            } elseif ($this->isEntity(get_class($value))) {
+                $type = 'object/entity';
+            } elseif (is_callable(array($value, '__toString'))) {
+                $type = 'object/string';
+            }
+        } elseif ('array' === $type && $this->isRange($value)) {
+            $type = 'array/range';
+        }
+
+        return $type;
+    }
+
+    /**
+     * Checks if class name is a Doctrine entity.
+     *
+     * @param $className
+     *
+     * @return bool
+     */
+    private function isEntity($className)
+    {
+        return $this->getEntityManager()->getMetadataFactory()->hasMetadataFor($className);
+    }
+
+    /**
+     * Checks if array can be used as a range array.
+     *
+     * @param array $array
+     *
+     * @return bool
+     */
+    private function isRange(array $array)
+    {
+        static $rangeTypes = array(
+            'boolean',
+            'integer',
+            'double',
+            'string',
+            'string/entity',
+            'object/datetime',
+            'object/string',
+        );
+
+        if (2 !== count($array)) {
+            return false;
+        }
+
+        $startType = $this->determineType($array[0]);
+        $endType = $this->determineType($array[1]);
+
+        return in_array($startType, $rangeTypes) && in_array($endType, $rangeTypes);
+    }
+
+    /**
+     * Adds inner-join to query builder.
+     *
+     * @param string $field
+     * @param string $alias
+     */
+    private function addInnerJoin($field, $alias)
+    {
+        $this->queryBuilder->innerJoin($field, $alias);
+    }
+
+    /**
+     * Adds where-condition to query builder.
+     *
      * @param string $field
      * @param string $operator
      * @param mixed $value
      */
-    protected function addWhere(QueryBuilder $queryBuilder, $field, $operator, $value)
+    private function addWhere($field, $operator, $value)
     {
-        $parameter = 'parameter_' . md5(serialize(implode('/', array($field, $operator, $value))));
-        if (is_null($value)) {
-            $queryBuilder->andWhere(sprintf('%s %s NULL', $field, $operator));
-        } elseif (is_array($value)) {
-            $queryBuilder->andWhere(sprintf('%s %s (:%s)', $field, $operator, $parameter));
-            $queryBuilder->setParameter($parameter, $value);
+        if (in_array($operator, array('IN', 'NOT IN'))) {
+            $parameter = $this->generateParameter($field, $operator, $value);
+            $this->queryBuilder->andWhere(sprintf('%s %s (:%s)', $field, $operator, $parameter));
+            $this->queryBuilder->setParameter($parameter, $value);
+        } elseif (in_array($operator, array('BETWEEN', 'NOT BETWEEN'))) {
+            $parameter1 = $this->generateParameter($field, $operator, $value[0]);
+            $parameter2 = $this->generateParameter($field, $operator, $value[1]);
+            $this->queryBuilder->andWhere(sprintf('%s %s :%s AND :%s', $field, $operator, $parameter1, $parameter2));
+            $this->queryBuilder->setParameter($parameter1, $value[0]);
+            $this->queryBuilder->setParameter($parameter2, $value[1]);
         } else {
-            $queryBuilder->andWhere(sprintf('%s %s :%s', $field, $operator, $parameter));
-            $queryBuilder->setParameter($parameter, $value);
-        }
-    }
-
-    /**
-     * Handles order by.
-     *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
-     * @param array|null $orderBy
-     *
-     * @throws \Doctrine\ORM\ORMException
-     */
-    protected function handleOrderBy(QueryBuilder $queryBuilder, array $orderBy = null)
-    {
-        if (is_null($orderBy)) {
-            $orderBy = $this->defaultOrderBy;
-        }
-        foreach ((array) $orderBy as $field => $order) {
-            if ($this->getClassMetadata()->hasField($field) || $this->getClassMetadata()->hasAssociation($field)) {
-                $this->addOrderBy($queryBuilder, $this->alias . '.' . $field, $order);
-            } else {
-                throw ORMException::unrecognizedField($field);
-            }
+            $parameter = $this->generateParameter($field, $operator, $value);
+            $this->queryBuilder->andWhere(sprintf('%s %s :%s', $field, $operator, $parameter));
+            $this->queryBuilder->setParameter($parameter, $value);
         }
     }
 
     /**
      * Adds order-by to query builder.
      *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
      * @param string $field
      * @param mixed $order
      */
-    protected function addOrderBy(QueryBuilder $queryBuilder, $field, $order)
+    private function addOrderBy($field, $order)
     {
-        $queryBuilder->addOrderBy($field, $order);
+        $this->queryBuilder->addOrderBy($field, $order);
     }
 
     /**
-     * Adds limit and offset to query builder.
+     * Generates unique table alias.
      *
-     * @param \Doctrine\ORM\QueryBuilder $queryBuilder
-     * @param int|null $limit
-     * @param int|null $offset
+     * @return string
      */
-    protected function addLimitAndOffset(
-        QueryBuilder $queryBuilder,
-        $limit = null,
-        $offset = null
-    ) {
-        $queryBuilder->setMaxResults($limit);
-        $queryBuilder->setFirstResult($offset);
+    private function generateAlias()
+    {
+        return '_t' . $this->aliasIndex++;
+    }
+
+    /**
+     * Generates parameter based on the field, operator and value.
+     *
+     * @param string $field
+     * @param string $operator
+     * @param mixed $value
+     *
+     * @return string
+     */
+    private function generateParameter($field, $operator, $value)
+    {
+        return 'parameter_' . md5(serialize(array($field, $operator, $value)));
     }
 }
